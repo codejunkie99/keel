@@ -188,6 +188,8 @@ pub enum SessionStatus {
 pub enum DecisionBackend {
     Laya,
     Jev,
+    /// Host scored the 0G catalog. No selector model was called.
+    Host,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

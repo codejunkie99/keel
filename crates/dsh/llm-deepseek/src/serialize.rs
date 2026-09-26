@@ -238,5 +238,6 @@ pub fn serialize_request(
         temperature: options.temperature,
         max_tokens: options.max_tokens,
         stop: options.stop.clone(),
+        verify_tee: None,
     })
 }

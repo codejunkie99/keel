@@ -27,6 +27,9 @@ pub struct WireRequest {
     /// Stop sequences (OpenAI `stop`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+    /// Ask 0G Router to verify a TEE attestation for this completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_tee: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -219,6 +219,12 @@ impl Translator {
         Ok(out)
     }
 
+    /// True once a choice payload opened a block or named a finish reason.
+    /// A later clean EOF can then be flushed like `[DONE]`.
+    pub fn has_terminal_progress(&self) -> bool {
+        self.pending_finish.is_some() || !self.order.is_empty()
+    }
+
     /// Handle the `[DONE]` sentinel: emit deferred block-ends, usage, and the
     /// finish. A `stop` (or absent) finish with no opened blocks is a
     /// degenerate provider completion → `EMPTY_RESPONSE` error finish.
@@ -249,5 +255,20 @@ impl Translator {
             replay_state: None,
         });
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Translator;
+
+    #[test]
+    fn content_counts_as_terminal_progress() {
+        let mut translator = Translator::new();
+        assert!(!translator.has_terminal_progress());
+        translator
+            .feed(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
+            .unwrap();
+        assert!(translator.has_terminal_progress());
     }
 }

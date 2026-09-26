@@ -164,6 +164,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 stream_idle_timeout_ms: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
                 retry_policy: dsh_llm::resolve_retry_policy(None, "dsh: deepseek retryPolicy")
                     .expect("default retry policy resolves"),
+                extra_headers: Vec::new(),
             }),
             resolve_api_key: Box::new(|connection| {
                 let reference = connection.api_key_env.clone();

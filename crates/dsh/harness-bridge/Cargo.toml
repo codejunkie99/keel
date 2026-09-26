@@ -23,6 +23,8 @@ dsh-session-persistence-jsonl = { workspace = true }
 dsh-system-prompt = { workspace = true }
 dsh-tools = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }

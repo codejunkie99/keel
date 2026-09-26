@@ -5979,9 +5979,9 @@ impl Shell {
                         .child(if self.laya_available {
                             "Laya is active for new tasks."
                         } else if self.laya_downloadable || self.laya_install.is_running() {
-                            "Laya is selected. The normal harness runs until the model is installed."
+                            "Laya is selected. Host scoring on the 0G catalog runs until the model is installed."
                         } else {
-                            "Laya is selected but unavailable here. The normal harness runs for now."
+                            "Laya is selected but unavailable here. Host scoring on the 0G catalog runs for now."
                         }),
                 )
             })
@@ -6125,7 +6125,7 @@ impl Shell {
                     .child(SharedString::from(if in_settings {
                         "Choose a decision backend for new tasks. Local Laya and direct TypeSafe Jev use the same setup as first launch."
                     } else {
-                        "Choose one decision backend for a run: local Laya or direct TypeSafe Jev with an existing credential. You can also use the normal harness."
+                        "Choose one decision backend for a run: local Laya or direct TypeSafe Jev with an existing credential. Normal mode scores the 0G catalog on the host."
                     })),
             )
             .child(local)

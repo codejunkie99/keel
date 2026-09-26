@@ -1196,7 +1196,9 @@ impl Render for AccountsPage {
         let local_tools: Vec<AnyElement> = match &self.installed_harnesses {
             Loadable::Ready(harnesses) => harnesses
                 .iter()
-                .filter(|harness| !matches!(harness.id, HarnessId::Mock | HarnessId::Dsh))
+                .filter(|harness| {
+                    !matches!(harness.id, HarnessId::Mock | HarnessId::Dsh | HarnessId::Og)
+                })
                 .map(|harness| {
                     let signed_in = self.snapshot.ready().is_some_and(|snapshot| {
                         snapshot

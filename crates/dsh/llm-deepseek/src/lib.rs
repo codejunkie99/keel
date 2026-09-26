@@ -17,7 +17,8 @@ mod wire;
 
 pub use adapter::{
     DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, DeepSeekAdapter,
-    DeepSeekAdapterOptions, DeepSeekCatalogModel, DeepSeekConnectionOptions, http_error_code,
+    DeepSeekAdapterOptions, DeepSeekCatalogModel, DeepSeekConnectionOptions, RequestOverlay,
+    http_error_code,
 };
 pub use serialize::{RequestDefaults, serialize_messages, serialize_request};
 pub use sse::{DONE, SseDecoder};

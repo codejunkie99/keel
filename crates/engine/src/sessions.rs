@@ -275,10 +275,24 @@ impl SessionsEngine {
         };
         let mut activity = SelectionActivityGuard::new(&self.inner, chat_id);
         match decision_mode::read(data_dir) {
-            DecisionMode::Normal => skipped(),
+            DecisionMode::Normal => {
+                crate::jev_routing::choose_with_report(
+                    &self.inner.registry,
+                    request,
+                    crate::jev_routing::RouteBackend::HostPolicy,
+                    |_| {},
+                )
+                .await
+            }
             DecisionMode::Jev => {
                 let Some(key_path) = decision_mode::protected_typesafe_key_path() else {
-                    return skipped();
+                    return crate::jev_routing::choose_with_report(
+                        &self.inner.registry,
+                        request,
+                        crate::jev_routing::RouteBackend::HostPolicy,
+                        |_| {},
+                    )
+                    .await;
                 };
                 crate::jev_routing::choose_with_report(
                     &self.inner.registry,
@@ -290,7 +304,13 @@ impl SessionsEngine {
             }
             DecisionMode::Laya => {
                 let Some((worker, model)) = decision_mode::laya_assets_in(data_dir) else {
-                    return skipped();
+                    return crate::jev_routing::choose_with_report(
+                        &self.inner.registry,
+                        request,
+                        crate::jev_routing::RouteBackend::HostPolicy,
+                        |_| {},
+                    )
+                    .await;
                 };
                 if self.inner.laya_selector.get().is_none() {
                     let Ok(selector) = LayaSelector::new(LayaConfig::standalone(worker, model))
@@ -374,6 +394,13 @@ impl SessionsEngine {
             .map(|(seq, event)| JournaledEvent { seq, event })
             .collect();
         Ok((replay, rx))
+    }
+
+    /// Forget the provider session after the user moves this chat onto a
+    /// different harness. The empty id is the resume tombstone: the next run
+    /// starts fresh instead of replaying the previous provider's session.
+    pub fn drop_harness_resume(&self, chat_id: &str) {
+        self.inner.drop_harness_resume(chat_id);
     }
 
     /// Start (or route) a run for `chat_id`.
@@ -494,10 +521,23 @@ impl SessionsEngine {
                 harness_id = choice.harness;
                 request.harness = Some(choice.harness);
                 request.model = choice.model;
+                let provider_strategy = choice.provider_strategy;
+                let trust_mode = choice.trust_mode;
+                let verify_tee = choice.verify_tee;
                 request.model_options.clear();
                 request
                     .model_options
                     .insert("jevRouted".into(), true.into());
+                request.model_options.insert(
+                    "ogProviderSort".into(),
+                    serde_json::Value::String(provider_strategy),
+                );
+                request
+                    .model_options
+                    .insert("ogTrustMode".into(), serde_json::Value::String(trust_mode));
+                request
+                    .model_options
+                    .insert("ogVerifyTee".into(), serde_json::Value::Bool(verify_tee));
             }
         }
         let harness = self.inner.registry.resolve(harness_id)?;
@@ -1078,12 +1118,27 @@ impl Inner {
         }
     }
 
-    // NB: there is deliberately no `forget_harness_session` anymore. The old
-    // tombstone fired on "run died before SessionStarted", which — since the
-    // ACP conversion made stale ids a harness-internal fallback — only ever
-    // meant a child STARTUP failure, and permanently severed good
-    // conversations (user incident 2026-08-13). A truly stale id simply
-    // yields a fresh session whose SessionStarted overwrites the row.
+    // NB: startup failures must not tombstone a session. The old
+    // `forget_harness_session` fired on "run died before SessionStarted",
+    // which — since the ACP conversion made stale ids a harness-internal
+    // fallback — only ever meant a child STARTUP failure, and permanently
+    // severed good conversations (user incident 2026-08-13). A truly stale id
+    // simply yields a fresh session whose SessionStarted overwrites the row.
+    //
+    // A user-initiated harness switch is different: the stored id belongs to
+    // the previous provider, and resuming it on Claude or 0G fails the run.
+    fn drop_harness_resume(&self, chat_id: &str) {
+        lock(&self.harness_sessions).insert(
+            chat_id.to_string(),
+            HarnessSessionRef {
+                session_id: String::new(),
+                cwd: String::new(),
+            },
+        );
+        if let Some(ws) = self.workspace() {
+            ws.set_chat_harness_session(chat_id, "", "");
+        }
+    }
 
     /// The session id to resume for a run in `chat_id` launching from `cwd`
     /// (keel sessions.ts:736, looked up on every dispatch):
@@ -1345,7 +1400,7 @@ fn consume_live_decision_activity(
     let AgentEvent::DecisionActivity { activity } = event else {
         return false;
     };
-    if harness_id == HarnessId::Dsh {
+    if matches!(harness_id, HarnessId::Dsh | HarnessId::Og) {
         inner.set_decision_activity(chat_id, *activity);
     }
     true

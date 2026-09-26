@@ -138,6 +138,7 @@ icon_assets![
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
+    (OG_MARK, "og-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — keel keeps it even on the

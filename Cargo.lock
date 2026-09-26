@@ -1886,6 +1886,8 @@ dependencies = [
  "futures",
  "keel-harness",
  "keel-proto",
+ "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

@@ -29,7 +29,7 @@ use dsh_llm::{
 };
 use dsh_llm_deepseek::{
     DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, DeepSeekAdapter,
-    DeepSeekAdapterOptions, DeepSeekConnectionOptions, RequestDefaults,
+    DeepSeekAdapterOptions, DeepSeekConnectionOptions, RequestDefaults, RequestOverlay,
 };
 use dsh_session::{SessionEventData, SessionId, SessionMeta, SessionStore, TurnEndReason};
 use dsh_session_persistence::{PersistenceService, install_write_behind};
@@ -50,6 +50,8 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
+pub mod og;
+
 /// Event sender type: futures channel so the receiver is a Send `Stream`.
 type EventTx = futures::channel::mpsc::UnboundedSender<Result<AgentEvent, HarnessError>>;
 
@@ -68,10 +70,20 @@ enum BridgeCommand {
 pub struct DshHarness {
     commands: Mutex<Option<mpsc::UnboundedSender<BridgeCommand>>>,
     decision_data_dir: Option<PathBuf>,
+    kind: LoopKind,
 }
 
-/// The embedded generation adapter needs its own DeepSeek credential. Laya
-/// and Jev choose bounded actions but do not supply a generation credential.
+/// Which in-process loop this actor serves. DeepSeek and 0G share the
+/// OpenAI-compatible tool loop, but each keeps its own endpoint, credential,
+/// and catalog.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopKind {
+    Deepseek,
+    Og,
+}
+
+/// The embedded DeepSeek adapter needs `DEEPSEEK_API_KEY`. Laya and Jev
+/// choose bounded actions but do not supply a generation credential.
 pub fn deepseek_credential_available() -> bool {
     std::env::var("DEEPSEEK_API_KEY").ok().is_some_and(|raw| {
         assert_usable_api_key(&raw, "dsh-llm-deepseek", "DEEPSEEK_API_KEY").is_ok()
@@ -86,17 +98,30 @@ impl Default for DshHarness {
 
 impl DshHarness {
     pub fn new() -> DshHarness {
-        DshHarness {
-            commands: Mutex::new(None),
-            decision_data_dir: None,
-        }
+        Self::with_kind(LoopKind::Deepseek, None)
     }
 
     /// Reads the local decision preference from the app data directory.
     pub fn with_decision_data_dir(path: PathBuf) -> DshHarness {
+        Self::with_kind(LoopKind::Deepseek, Some(path))
+    }
+
+    /// 0G Router loop. Does not replace [`Self::new`]; DeepSeek stays on the
+    /// direct API even when `OG_API_KEY` is set.
+    pub fn og() -> DshHarness {
+        Self::with_kind(LoopKind::Og, None)
+    }
+
+    /// 0G Router loop with the local decision preference directory.
+    pub fn og_with_decision_data_dir(path: PathBuf) -> DshHarness {
+        Self::with_kind(LoopKind::Og, Some(path))
+    }
+
+    fn with_kind(kind: LoopKind, decision_data_dir: Option<PathBuf>) -> DshHarness {
         DshHarness {
             commands: Mutex::new(None),
-            decision_data_dir: Some(path),
+            decision_data_dir,
+            kind,
         }
     }
 
@@ -110,10 +135,17 @@ impl DshHarness {
         }
         let (tx, rx) = mpsc::unbounded_channel();
         let decision_data_dir = self.decision_data_dir.clone();
+        let kind = self.kind;
         std::thread::Builder::new()
-            .name("dsh-harness".into())
-            .spawn(move || actor_thread(rx, decision_data_dir))
-            .expect("spawn dsh harness thread");
+            .name(
+                match kind {
+                    LoopKind::Og => "og-router",
+                    LoopKind::Deepseek => "dsh-harness",
+                }
+                .into(),
+            )
+            .spawn(move || actor_thread(rx, decision_data_dir, kind))
+            .expect("spawn in-process harness thread");
         *slot = Some(tx.clone());
         tx
     }
@@ -122,11 +154,17 @@ impl DshHarness {
 #[async_trait]
 impl Harness for DshHarness {
     fn id(&self) -> HarnessId {
-        HarnessId::Dsh
+        match self.kind {
+            LoopKind::Deepseek => HarnessId::Dsh,
+            LoopKind::Og => HarnessId::Og,
+        }
     }
 
     fn display_name(&self) -> &str {
-        "DeepSeek Harness"
+        match self.kind {
+            LoopKind::Deepseek => "DeepSeek Harness",
+            LoopKind::Og => "0G Router",
+        }
     }
 
     fn supports_steering(&self) -> bool {
@@ -141,12 +179,22 @@ impl Harness for DshHarness {
         &[ReasoningLevel::Medium]
     }
 
-    /// The in-process runtime is selectable only when generation can start.
+    /// Each loop is selectable only when its own credential is present.
     fn installed(&self) -> bool {
-        deepseek_credential_available()
+        match self.kind {
+            LoopKind::Deepseek => deepseek_credential_available(),
+            LoopKind::Og => og::api_key_available(),
+        }
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        if self.kind == LoopKind::Og {
+            return Ok(og::load_catalog()
+                .await
+                .iter()
+                .map(og::to_harness_model)
+                .collect());
+        }
         Ok(vec![
             Model {
                 id: "deepseek-chat".into(),
@@ -473,10 +521,13 @@ mod decision_translation_tests {
 /// The dsh composition living on the actor thread: the same stack the `dsh`
 /// CLI boots, minus stdout wiring.
 struct Composition {
+    harness: HarnessId,
     sessions: Rc<SessionStore>,
     agents: Rc<AgentRegistry>,
     /// Live per-session event forwarders, keyed by session id string.
     forwarders: Rc<RefCell<HashMap<String, EventTx>>>,
+    /// 0G trust and sort headers for the session the adapter is about to call.
+    og_overlays: Rc<RefCell<HashMap<String, RequestOverlay>>>,
     _app: App,
 }
 
@@ -509,7 +560,10 @@ fn install_tools(
     Ok(())
 }
 
-fn build_composition(decision_data_dir: Option<PathBuf>) -> anyhow::Result<Composition> {
+fn build_composition(
+    decision_data_dir: Option<PathBuf>,
+    kind: LoopKind,
+) -> anyhow::Result<Composition> {
     let app = App::new();
     let ctx = app.root();
     let home = dsh_home_paths::resolve_dsh_home(None);
@@ -518,10 +572,16 @@ fn build_composition(decision_data_dir: Option<PathBuf>) -> anyhow::Result<Compo
     let sessions = SessionStore::provide(&ctx).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let agents = AgentRegistry::provide(&ctx).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let llm = LlmRuntime::provide(&ctx).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let og = kind == LoopKind::Og;
     let system_prompt = SystemPrompt::new(
         &ctx,
         PromptConfig {
-            persona: "Answer the user's task directly and concisely.".into(),
+            persona: if og {
+                "You are an AI agent. The 0G Router chooses the inference provider. Answer the user's task directly and concisely.".into()
+            } else {
+                "Answer the user's task directly and concisely.".into()
+            },
+            include_harness_identity: !og,
             ..PromptConfig::default()
         },
     )?;
@@ -544,15 +604,23 @@ fn build_composition(decision_data_dir: Option<PathBuf>) -> anyhow::Result<Compo
         })?;
     }
 
-    llm.register_adapter(
-        &["deepseek".to_string()],
-        Rc::new(DeepSeekAdapter::new(DeepSeekAdapterOptions {
-            options: Box::new(|| DeepSeekConnectionOptions {
-                base_url: std::env::var("DEEPSEEK_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.deepseek.com".into())
-                    .trim_end_matches('/')
-                    .to_string(),
-                api_key_env: "DEEPSEEK_API_KEY".into(),
+    let og_endpoint = kind == LoopKind::Og;
+    let adapter = Rc::new(DeepSeekAdapter::new(DeepSeekAdapterOptions {
+        options: Box::new(move || {
+            DeepSeekConnectionOptions {
+                base_url: if og_endpoint {
+                    og::base_url()
+                } else {
+                    std::env::var("DEEPSEEK_BASE_URL")
+                        .unwrap_or_else(|_| "https://api.deepseek.com".into())
+                        .trim_end_matches('/')
+                        .to_string()
+                },
+                api_key_env: if og_endpoint {
+                    "OG_API_KEY".into()
+                } else {
+                    "DEEPSEEK_API_KEY".into()
+                },
                 defaults: RequestDefaults::default(),
                 max_tokens: DEFAULT_MAX_TOKENS,
                 default_context_window: DEFAULT_CONTEXT_WINDOW,
@@ -560,24 +628,34 @@ fn build_composition(decision_data_dir: Option<PathBuf>) -> anyhow::Result<Compo
                 stream_idle_timeout_ms: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
                 retry_policy: dsh_llm::resolve_retry_policy(None, "dsh: deepseek retryPolicy")
                     .expect("default retry policy resolves"),
-            }),
-            resolve_api_key: Box::new(|connection| {
-                let reference = connection.api_key_env.clone();
-                async move {
-                    let raw = std::env::var(&reference).map_err(|_| {
-                        dsh_llm::LlmError::new(
-                            format!("no API key: set {reference} in the environment"),
-                            "MISSING_CREDENTIAL",
-                        )
-                    })?;
-                    assert_usable_api_key(&raw, "dsh-llm-deepseek", &reference)
-                }
-                .boxed_local()
-            }),
-            resolve_user_id: Box::new(|| "dsh-rs".to_string()),
-        })),
-    )
-    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                extra_headers: if og_endpoint {
+                    vec![(
+                        "X-0G-Provider-Trust-Mode".into(),
+                        trust_header(og::trust_from_env()),
+                    )]
+                } else {
+                    Vec::new()
+                },
+            }
+        }),
+        resolve_api_key: Box::new(|connection| {
+            let reference = connection.api_key_env.clone();
+            async move {
+                let raw = std::env::var(&reference).map_err(|_| {
+                    dsh_llm::LlmError::new(
+                        format!("no API key: set {reference} in the environment"),
+                        "MISSING_CREDENTIAL",
+                    )
+                })?;
+                assert_usable_api_key(&raw, "dsh-llm-deepseek", &reference)
+            }
+            .boxed_local()
+        }),
+        resolve_user_id: Box::new(|| "dsh-rs".to_string()),
+    }));
+    let og_overlays = adapter.overlays();
+    llm.register_adapter(&["deepseek".to_string()], adapter)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     AgentLoop::install_with_decision_data_dir(
         &ctx,
@@ -612,26 +690,70 @@ fn build_composition(decision_data_dir: Option<PathBuf>) -> anyhow::Result<Compo
     register_live_activity_forwarder(&ctx, forwarders.clone())?;
 
     Ok(Composition {
+        harness: match kind {
+            LoopKind::Deepseek => HarnessId::Dsh,
+            LoopKind::Og => HarnessId::Og,
+        },
         sessions,
         agents,
         forwarders,
+        og_overlays,
         _app: app,
+    })
+}
+
+fn trust_header(trust: og::TrustMode) -> String {
+    match trust {
+        og::TrustMode::Private => "private".into(),
+        og::TrustMode::Verified => "verified".into(),
+        og::TrustMode::Standard => "standard".into(),
+    }
+}
+
+fn overlay_for(request: &RunRequest) -> Option<RequestOverlay> {
+    let sort = request
+        .model_options
+        .get("ogProviderSort")
+        .and_then(|value| value.as_str())?;
+    let trust = request
+        .model_options
+        .get("ogTrustMode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("standard");
+    let mut headers = vec![("X-0G-Provider-Trust-Mode".into(), trust.to_string())];
+    if sort != "default" {
+        headers.push(("X-0G-Provider-Sort".into(), sort.to_string()));
+    }
+    Some(RequestOverlay {
+        base_url: og::base_url(),
+        api_key_env: "OG_API_KEY".into(),
+        headers,
+        verify_tee: request
+            .model_options
+            .get("ogVerifyTee")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
     })
 }
 
 fn actor_thread(
     mut commands: mpsc::UnboundedReceiver<BridgeCommand>,
     decision_data_dir: Option<PathBuf>,
+    kind: LoopKind,
 ) {
+    let runtime = match kind {
+        LoopKind::Og => "0G router",
+        LoopKind::Deepseek => "dsh",
+    };
     dsh_cordis::run(async move {
-        let composition = match build_composition(decision_data_dir) {
+        let composition = match build_composition(decision_data_dir, kind) {
             Ok(composition) => Rc::new(composition),
             Err(error) => {
-                tracing::error!("dsh bridge composition failed: {error:#}");
+                tracing::error!("{runtime} bridge composition failed: {error:#}");
                 // Drain commands, failing each run loudly.
                 while let Some(BridgeCommand::Run { events, .. }) = commands.recv().await {
                     let _ = events.unbounded_send(Ok(AgentEvent::Error {
-                        message: format!("dsh runtime failed to start: {error:#}"),
+                        message: format!("{runtime} runtime failed to start: {error:#}"),
                     }));
                     let _ = events.unbounded_send(Ok(AgentEvent::Done {
                         status: DoneStatus::Errored,
@@ -679,10 +801,13 @@ async fn drive_run(
     mut steering: mpsc::Receiver<SteerMessage>,
     interrupt: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    let model = request
-        .model
-        .clone()
-        .unwrap_or_else(|| "deepseek-chat".into());
+    let model = request.model.clone().unwrap_or_else(|| {
+        if composition.harness == HarnessId::Og {
+            "glm-5.2".into()
+        } else {
+            "deepseek-chat".into()
+        }
+    });
     let agent_options = AgentOptions {
         provider: Some("deepseek".into()),
         model: Some(model.clone()),
@@ -715,9 +840,19 @@ async fn drive_run(
         }
     };
     let session_id = handle.agent.id().as_str().to_string();
+    // Overlays rewrite the endpoint. Only the 0G loop may apply them, so a
+    // DeepSeek run keeps api.deepseek.com and DEEPSEEK_API_KEY.
+    if composition.harness == HarnessId::Og
+        && let Some(overlay) = overlay_for(&request)
+    {
+        composition
+            .og_overlays
+            .borrow_mut()
+            .insert(session_id.clone(), overlay);
+    }
 
     let _ = events.unbounded_send(Ok(AgentEvent::SessionStarted {
-        harness: HarnessId::Dsh,
+        harness: composition.harness,
         model,
         tools: vec![],
         cwd: request.cwd.clone(),
@@ -796,6 +931,7 @@ async fn drive_run(
         tracing::warn!("dsh bridge flush failed: {}", error.0);
     }
     composition.forwarders.borrow_mut().remove(&session_id);
+    composition.og_overlays.borrow_mut().remove(&session_id);
     handle.dispose().await;
     let _ = events.unbounded_send(Ok(done));
     Ok(())

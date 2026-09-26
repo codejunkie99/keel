@@ -19,6 +19,10 @@ pub enum HarnessId {
     /// The in-process DeepSeek Harness runtime (the dsh-* crates in this
     /// workspace), bridged natively — no subprocess, no ACP.
     Dsh,
+    /// In-process 0G Router. The host picks a catalog model and 0G chooses
+    /// the provider. Independent of [`HarnessId::Dsh`], which stays on the
+    /// direct DeepSeek API.
+    Og,
     /// Test harness; never shown in production pickers.
     Mock,
 }

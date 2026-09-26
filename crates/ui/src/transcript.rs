@@ -1165,13 +1165,17 @@ pub fn flavour_seed(chat_id: &str) -> u64 {
 /// ordinary Working animation keeps its neutral vocabulary.
 pub fn decision_activity_label(activity: DecisionActivity) -> &'static str {
     match (activity.backend, activity.phase) {
-        (DecisionBackend::Laya, DecisionPhase::Choosing) => "Laya is choosing a coding route…",
-        (DecisionBackend::Jev, DecisionPhase::Choosing) => "Jev is choosing a coding route…",
+        (DecisionBackend::Laya, DecisionPhase::Choosing) => "Laya is choosing a 0G model…",
+        (DecisionBackend::Jev, DecisionPhase::Choosing) => "Jev is choosing a 0G model…",
+        (DecisionBackend::Host, DecisionPhase::Choosing) => "Host is scoring the 0G catalog…",
         (DecisionBackend::Laya, DecisionPhase::ChoosingFocus) => {
             "Laya is choosing a focus for this step…"
         }
         (DecisionBackend::Jev, DecisionPhase::ChoosingFocus) => {
             "Jev is choosing a focus for this step…"
+        }
+        (DecisionBackend::Host, DecisionPhase::ChoosingFocus) => {
+            "Host is choosing a focus for this step…"
         }
     }
 }
@@ -1180,6 +1184,7 @@ fn decision_backend_label(backend: DecisionBackend) -> &'static str {
     match backend {
         DecisionBackend::Laya => "Laya",
         DecisionBackend::Jev => "Jev",
+        DecisionBackend::Host => "Host",
     }
 }
 
@@ -5082,11 +5087,11 @@ mod tests {
         };
         assert_eq!(
             decision_activity_label(choosing(DecisionBackend::Laya)),
-            "Laya is choosing a coding route…"
+            "Laya is choosing a 0G model…"
         );
         assert_eq!(
             decision_activity_label(choosing(DecisionBackend::Jev)),
-            "Jev is choosing a coding route…"
+            "Jev is choosing a 0G model…"
         );
         assert_eq!(
             decision_activity_label(DecisionActivity {

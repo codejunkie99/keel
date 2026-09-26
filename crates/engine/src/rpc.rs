@@ -732,11 +732,16 @@ impl EngineRpc {
                 .set_chat_archived(&chat_id, archived)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatConfig { chat_id, config } => self
-                .workspace
-                .set_chat_config(&chat_id, &config)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatConfig { chat_id, config } => {
+                let previous = self.workspace.chat_config(&chat_id).map(|row| row.harness);
+                self.workspace
+                    .set_chat_config(&chat_id, &config)
+                    .map_err(failed)?;
+                if previous.is_some_and(|harness| harness != config.harness) {
+                    self.sessions.drop_harness_resume(&chat_id);
+                }
+                Ok(())
+            }
             MutateParams::DeleteChat { chat_id } => {
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
