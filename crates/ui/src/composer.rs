@@ -4471,7 +4471,9 @@ impl Composer {
             .is_some_and(|mode| {
                 matches!(
                     mode,
-                    onboarding::DecisionMode::Laya | onboarding::DecisionMode::Jev
+                    onboarding::DecisionMode::Laya
+                        | onboarding::DecisionMode::Jev
+                        | onboarding::DecisionMode::Normal
                 )
             });
         if decision_enabled && self.pickers.read(cx).jev_auto_eligible(cx) {

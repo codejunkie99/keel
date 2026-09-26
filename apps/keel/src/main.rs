@@ -420,6 +420,8 @@ fn harness_from_env() -> keel_engine::HarnessId {
         Ok("grok") => keel_engine::HarnessId::Grok,
         Ok("hermes") => keel_engine::HarnessId::Hermes,
         Ok("pi") => keel_engine::HarnessId::Pi,
+        Ok("dsh") => keel_engine::HarnessId::Dsh,
+        Ok("og") => keel_engine::HarnessId::Og,
         _ => keel_engine::HarnessId::ClaudeCode,
     }
 }

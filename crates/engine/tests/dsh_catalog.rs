@@ -18,7 +18,8 @@ fn dsh_harness_is_catalogued_and_resolvable() {
     assert_eq!(dsh.name, "DeepSeek Harness");
     assert!(dsh.supports_steering);
     assert_eq!(dsh.steering_mode, SteeringMode::StepBoundary);
-    // In-process, but only ready in the picker with a usable local credential.
+    // In-process, but only ready in the picker with a DeepSeek credential.
+    // An OG_API_KEY must not mark this slot installed.
     assert_eq!(
         dsh.installed,
         dsh_harness_bridge::deepseek_credential_available()
@@ -32,6 +33,19 @@ fn dsh_harness_is_catalogued_and_resolvable() {
         .expect("dsh slot resolves in-process");
     assert_eq!(harness.id(), HarnessId::Dsh);
     assert_eq!(harness.display_name(), "DeepSeek Harness");
+
+    let og = descriptors
+        .iter()
+        .find(|descriptor| descriptor.id == HarnessId::Og)
+        .expect("0G Router appears beside DeepSeek");
+    assert_eq!(og.name, "0G Router");
+    assert_eq!(og.installed, dsh_harness_bridge::og::api_key_available());
+    assert!(!descriptor_enabled(og));
+    let og_harness = registry
+        .resolve(HarnessId::Og)
+        .expect("0G slot resolves in-process");
+    assert_eq!(og_harness.id(), HarnessId::Og);
+    assert_eq!(og_harness.display_name(), "0G Router");
 
     // The descriptor must not drift from the resolved harness (the same
     // stability rule the claude/codex slots are held to).

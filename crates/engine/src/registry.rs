@@ -338,7 +338,8 @@ fn build_default_registry(decision_data_dir: Option<PathBuf>) -> HarnessRegistry
         ],
     }));
     // The in-process DeepSeek Harness runtime (dsh-* crates): no CLI to
-    // probe, lazy so listing never boots its actor thread.
+    // probe, lazy so listing never boots its actor thread. A present
+    // OG_API_KEY does not retarget this slot.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Dsh,
@@ -350,10 +351,38 @@ fn build_default_registry(decision_data_dir: Option<PathBuf>) -> HarnessRegistry
             enabled: None,
         },
         Box::new(dsh_harness_bridge::deepseek_credential_available),
+        Box::new({
+            let decision_data_dir = decision_data_dir.clone();
+            move || {
+                let harness = match &decision_data_dir {
+                    Some(path) => {
+                        dsh_harness_bridge::DshHarness::with_decision_data_dir(path.clone())
+                    }
+                    None => dsh_harness_bridge::DshHarness::new(),
+                };
+                Ok(Arc::new(harness))
+            }
+        }),
+    );
+    // Sibling in-process loop. Auto-route targets this slot; DeepSeek stays
+    // available for a manual pin.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Og,
+            name: "0G Router".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(dsh_harness_bridge::og::api_key_available),
         Box::new(move || {
             let harness = match &decision_data_dir {
-                Some(path) => dsh_harness_bridge::DshHarness::with_decision_data_dir(path.clone()),
-                None => dsh_harness_bridge::DshHarness::new(),
+                Some(path) => {
+                    dsh_harness_bridge::DshHarness::og_with_decision_data_dir(path.clone())
+                }
+                None => dsh_harness_bridge::DshHarness::og(),
             };
             Ok(Arc::new(harness))
         }),
@@ -536,6 +565,7 @@ mod tests {
             vec![
                 HarnessId::Mock,
                 HarnessId::Dsh,
+                HarnessId::Og,
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
                 HarnessId::Cursor,

@@ -27,6 +27,8 @@ use dsh_llm::{
 };
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt, StreamExt};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -76,6 +78,18 @@ pub struct DeepSeekConnectionOptions {
     pub stream_idle_timeout_ms: u64,
     /// Provider-owned retry policy, already resolved.
     pub retry_policy: ResolvedRetryPolicy,
+    /// Extra HTTP headers for this connection snapshot. 0G trust and sort
+    /// ride here; an empty list leaves the request unchanged.
+    pub extra_headers: Vec<(String, String)>,
+}
+
+/// Per-session 0G dispatch facts. Present only for a routed 0G call.
+#[derive(Debug, Clone)]
+pub struct RequestOverlay {
+    pub base_url: String,
+    pub api_key_env: String,
+    pub headers: Vec<(String, String)>,
+    pub verify_tee: bool,
 }
 
 /// Operation-local resolution hooks the registering plugin owns (upstream
@@ -187,6 +201,7 @@ pub fn http_error_code(status: u16, error: Option<&crate::wire::WireErrorDetail>
 pub struct DeepSeekAdapter {
     config: Rc<DeepSeekAdapterOptions>,
     client: reqwest::Client,
+    overlays: Rc<RefCell<HashMap<String, RequestOverlay>>>,
 }
 
 impl DeepSeekAdapter {
@@ -194,7 +209,14 @@ impl DeepSeekAdapter {
         DeepSeekAdapter {
             config: Rc::new(config),
             client: reqwest::Client::new(),
+            overlays: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    /// Session-scoped 0G headers. The bridge writes one entry before the turn
+    /// and removes it when the run finishes.
+    pub fn overlays(&self) -> Rc<RefCell<HashMap<String, RequestOverlay>>> {
+        self.overlays.clone()
     }
 }
 
@@ -284,8 +306,21 @@ impl LlmAdapter for DeepSeekAdapter {
         // freeze here for the whole request; the next call re-resolves.
         let config = self.config.clone();
         let client = self.client.clone();
+        let overlays = self.overlays.clone();
         stream! {
-            let connection = (config.options)();
+            let mut connection = (config.options)();
+            let session_key = options
+                .session_id
+                .as_ref()
+                .map(|id| id.as_str().to_string());
+            let overlay = session_key
+                .as_ref()
+                .and_then(|id| overlays.borrow().get(id).cloned());
+            if let Some(overlay) = &overlay {
+                connection.base_url = overlay.base_url.clone();
+                connection.api_key_env = overlay.api_key_env.clone();
+                connection.extra_headers = overlay.headers.clone();
+            }
             let api_key = match (config.resolve_api_key)(&connection).await {
                 Ok(key) => key,
                 Err(error) => {
@@ -295,13 +330,16 @@ impl LlmAdapter for DeepSeekAdapter {
             };
             let user_id = (config.resolve_user_id)();
 
-            let body = match serialize_request(&options, &connection.defaults) {
+            let mut body = match serialize_request(&options, &connection.defaults) {
                 Ok(body) => body,
                 Err(error) => {
                     yield Err(anyhow::Error::new(error));
                     return;
                 }
             };
+            if overlay.as_ref().is_some_and(|item| item.verify_tee) {
+                body.verify_tee = Some(true);
+            }
             let mut request = client
                 .post(format!("{}/chat/completions", connection.base_url))
                 .header("authorization", format!("Bearer {api_key}"))
@@ -317,6 +355,9 @@ impl LlmAdapter for DeepSeekAdapter {
             }
             if options.purpose == Some(dsh_llm::CallPurpose::Compaction) {
                 request = request.header("x-deepseek-harness-compact", "1");
+            }
+            for (name, value) in &connection.extra_headers {
+                request = request.header(name, value);
             }
 
             let aborted = || options.signal.as_ref().map(|s| s.aborted()).unwrap_or(false);
@@ -337,6 +378,19 @@ impl LlmAdapter for DeepSeekAdapter {
                     return;
                 }
             };
+
+            if overlay.is_some() {
+                for (name, value) in response.headers().iter() {
+                    let header = name.as_str();
+                    if header.contains("0g") || header.starts_with("zg-") {
+                        tracing::info!(
+                            header,
+                            value = value.to_str().unwrap_or(""),
+                            "0G response header"
+                        );
+                    }
+                }
+            }
 
             let status = response.status().as_u16();
             if !(200..300).contains(&status) {
@@ -422,14 +476,27 @@ impl LlmAdapter for DeepSeekAdapter {
                 }
             }
             if !finished {
-                // EOF before [DONE] is truncation — the model call cannot be
-                // trusted.
-                yield Err(anyhow::Error::new(LlmError::new(
-                    "SSE stream ended without [DONE]",
-                    "STREAM_CLOSED",
-                )));
+                // 0G closes a finished completion without the OpenAI `[DONE]`
+                // sentinel. DeepSeek's own API still treats that EOF as
+                // truncation.
+                if og_endpoint(&connection) && translator.has_terminal_progress() {
+                    for chunk in translator.done() {
+                        yield Ok(chunk);
+                    }
+                } else {
+                    yield Err(anyhow::Error::new(LlmError::new(
+                        "SSE stream ended without [DONE]",
+                        "STREAM_CLOSED",
+                    )));
+                }
             }
         }
         .boxed_local()
     }
+}
+
+/// 0G Router speaks chat-completions but ends a finished stream by closing
+/// the body, without `data: [DONE]`.
+fn og_endpoint(connection: &DeepSeekConnectionOptions) -> bool {
+    connection.api_key_env == "OG_API_KEY" || connection.base_url.contains("0g.ai")
 }

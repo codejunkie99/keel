@@ -690,7 +690,8 @@ impl Pickers {
         &self.config
     }
 
-    /// Harness is locked once the chat exists (feature-inventory §1.7).
+    /// Existing chats open on their own harness, not the favorites rail.
+    /// The rail can still move the chat onto another enabled agent.
     fn harness_locked(&self, cx: &App) -> bool {
         self.state.read(cx).selected_chat.is_some()
     }
@@ -750,8 +751,14 @@ impl Pickers {
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
         }
-        if let Some(chat) = self.state.read(cx).selected_chat_row() {
-            return chat.config.as_ref().and_then(|c| c.model.as_deref());
+        if let Some(chat) = self.state.read(cx).selected_chat_row()
+            && let Some(config) = chat.config.as_ref()
+            && self
+                .config
+                .harness
+                .is_none_or(|harness| harness == config.harness)
+        {
+            return config.model.as_deref();
         }
         let harness = self.effective_harness(cx)?;
         self.defaults.model_for(harness).map(|m| m.id.as_str())
@@ -1110,6 +1117,11 @@ impl Pickers {
                 {
                     pickers.active = pickers.selected_model_index(cx);
                 }
+                // A rail switch that happened before this catalog arrived can
+                // now name a concrete model and persist it.
+                if pickers.config.harness == Some(harness) {
+                    pickers.persist_switched_harness(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -1288,10 +1300,8 @@ impl Pickers {
     }
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        if self.harness_locked(cx) {
-            return;
-        }
-        if self.config.harness != Some(harness) {
+        let switching = self.effective_harness(cx) != Some(harness);
+        if switching {
             // The remembered model for this harness takes over via the
             // defaults fallback; a foreign pick must not linger.
             self.config.model = None;
@@ -1305,7 +1315,45 @@ impl Pickers {
         self.ensure_models(harness, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
+        if switching {
+            self.persist_switched_harness(cx);
+        }
         cx.notify();
+    }
+
+    /// Write a harness change onto an existing chat. A new-chat canvas keeps
+    /// the pick in the draft until send. No-op until the new catalog can name
+    /// a model, so a Codex id is never stored against 0G or Claude.
+    fn persist_switched_harness(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_chat.is_none() {
+            return;
+        }
+        let Some(harness) = self.config.harness else {
+            return;
+        };
+        let already = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.config.as_ref())
+            .is_some_and(|config| config.harness == harness);
+        if already {
+            return;
+        }
+        let Some(model) = self.selected_model(cx).map(|model| model.id.clone()) else {
+            return;
+        };
+        self.update_chat_config(cx, move |config| {
+            config.harness = harness;
+            config.model = Some(model);
+            // A manual agent switch is a pin. Drop host-routing leftovers from
+            // the previous harness so the next run stays on this choice.
+            config.model_options.remove("jevAuto");
+            config.model_options.remove("jevRouted");
+            config.model_options.remove("ogProviderSort");
+            config.model_options.remove("ogTrustMode");
+            config.model_options.remove("ogVerifyTee");
+        });
     }
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
@@ -1483,14 +1531,10 @@ impl Pickers {
     /// A live search spans every ready harness (t3: the sidebar hides and
     /// the query ignores it); otherwise the rail selection decides —
     /// favorites across harnesses, or the effective harness's list with its
-    /// starred rows floated to the top (t3 `groupFavorites`). A locked chat
-    /// restricts every view to its own harness.
+    /// starred rows floated to the top (t3 `groupFavorites`).
     fn visible_model_rows(&self, cx: &App) -> Vec<ModelRowData> {
         let effective = self.effective_harness(cx);
-        let mut descriptors = self.rail_descriptors(cx);
-        if self.harness_locked(cx) {
-            descriptors.retain(|d| Some(d.id) == effective);
-        }
+        let descriptors = self.rail_descriptors(cx);
         let row = |descriptor: &HarnessDescriptor, model: &Model| ModelRowData {
             harness: descriptor.id,
             harness_name: SharedString::from(descriptor.name.clone()),
@@ -1591,9 +1635,6 @@ impl Pickers {
             return;
         };
         if self.effective_harness(cx) != Some(row.harness) {
-            if self.harness_locked(cx) {
-                return;
-            }
             self.pick_harness(row.harness, cx);
         }
         self.pick_model(row.model.id, cx);
@@ -2781,8 +2822,8 @@ impl Pickers {
 
     /// The combined harness + model switcher (keel harness-model-picker.tsx):
     /// a vertical harness rail of square brand-icon tabs on the left, the
-    /// viewed harness's models on the right. On an existing chat the other
-    /// tabs stay visible but disabled — the lock reads as a rule.
+    /// viewed harness's models on the right. An existing chat can move onto
+    /// another enabled agent; that switch starts a fresh provider session.
     /// The harness/model picker (t3code ModelPickerContent): an icons-only
     /// harness rail on the left (favorites star on top), a search box over
     /// the model list on the right. Rows are two lines — model name over the
@@ -2826,7 +2867,6 @@ impl Pickers {
             Loadable::Ready(_) => {}
         }
 
-        let locked = self.harness_locked(cx);
         let effective = self.effective_harness(cx);
         let model_scroll = self.model_scroll.clone();
         let query = self.search.read(cx).text().trim().to_string();
@@ -2897,7 +2937,6 @@ impl Pickers {
             for (ix, descriptor) in descriptors.iter().enumerate() {
                 let harness = descriptor.id;
                 let is_viewed = !favorites_view && effective == Some(harness);
-                let is_disabled = locked && effective != Some(harness);
                 let (icon_path, tint) = harness_brand_icon(harness);
                 column = column.child(
                     div()
@@ -2909,9 +2948,8 @@ impl Pickers {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(is_disabled, |el| el.opacity(0.35))
-                        .when(!is_disabled, |el| el.cursor_pointer())
-                        .when(!is_disabled && !is_viewed, |el| {
+                        .cursor_pointer()
+                        .when(!is_viewed, |el| {
                             el.hover(|s| s.bg(crate::theme::ink(0.06)))
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -3508,6 +3546,9 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // In-process runtime with no brand asset yet: the neutral command
         // glyph, surface-tinted like the monochrome marks.
         HarnessId::Dsh => (crate::icons::COMMAND, None),
+        // Official 0G wordmark (https://0g.ai/brandkit). Wide lockup; the
+        // square icon box letterboxes it. currentColor follows the white logo.
+        HarnessId::Og => (crate::icons::OG_MARK, None),
     }
 }
 

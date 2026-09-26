@@ -44,6 +44,7 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "Nous Research's Hermes Agent (hermes CLI).",
         HarnessId::Pi => "The pi coding agent (pi CLI).",
         HarnessId::Dsh => "DeepSeek Harness, running in-process (no CLI required).",
+        HarnessId::Og => "In-process coding loop. 0G Router chooses the provider.",
         HarnessId::Mock => "Scripted test harness.",
     }
 }
@@ -58,6 +59,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Dsh => "dsh",
+        HarnessId::Og => "0g",
         HarnessId::Mock => "mock",
     }
 }
@@ -72,14 +74,14 @@ fn decision_status(
         DecisionMode::Laya => "Laya model and worker found",
         DecisionMode::Jev => "Jev credential found",
         DecisionMode::Normal if mode != DecisionMode::Normal => "Normal harness fallback",
-        DecisionMode::Normal => "Normal harness selected",
+        DecisionMode::Normal => "Host scores the 0G catalog",
     };
     let pending = match mode {
         DecisionMode::Laya if !laya_available => Some(format!(
-            "Laya selected · {laya_status}. New tasks use the normal harness until Laya is ready."
+            "Laya selected · {laya_status}. New tasks use host scoring on the 0G catalog until Laya is ready."
         )),
         DecisionMode::Jev if !jev_available => Some(
-            "Jev selected · protected credential unavailable. New tasks use the normal harness."
+            "Jev selected · protected credential unavailable. New tasks use host scoring on the 0G catalog."
                 .to_string(),
         ),
         _ => None,
@@ -729,10 +731,14 @@ impl HarnessesPage {
                         .into_any_element(),
                 ];
                 if !installed {
-                    let guidance = if harness == HarnessId::Dsh {
-                        "Set DEEPSEEK_API_KEY in Keel's launching environment to enable the embedded harness".to_string()
-                    } else {
-                        format!("Install the {} CLI to enable", cli_name(harness))
+                    let guidance = match harness {
+                        HarnessId::Dsh => {
+                            "Set DEEPSEEK_API_KEY in Keel's launching environment".to_string()
+                        }
+                        HarnessId::Og => {
+                            "Set OG_API_KEY in Keel's launching environment".to_string()
+                        }
+                        _ => format!("Install the {} CLI to enable", cli_name(harness)),
                     };
                     meta.push(
                         div()
